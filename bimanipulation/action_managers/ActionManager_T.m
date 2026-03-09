@@ -1,0 +1,160 @@
+classdef ActionManager_T < handle
+    properties
+        actions = {}      
+        actions_ids = {}  
+        currentAction = 1 
+        
+        % --- Transition State Variables ---
+        activeStack = {}       
+        transitionPlan = []    
+        inTransition = false   
+        t_switch = 0           
+        t_max = 3.0            % Duration of transition (seconds)
+        
+        completion_threshold = 0.00001; % Velocity norm threshold for auto-switch
+    end
+
+    methods
+        function obj = ActionManager_T()
+            obj.actions = {};
+            obj.actions_ids = {};
+            obj.currentAction = 1;
+        end
+
+        function addAction(obj, taskStack, taskStackID)
+            obj.actions{end+1} = taskStack;
+            obj.actions_ids{end+1} = taskStackID;
+            
+            % Initialize first action immediately
+            if length(obj.actions) == 1
+                obj.activeStack = taskStack;
+                % Initial plan: All tasks are "Keeping" (Type 0)
+                obj.transitionPlan = struct('id', taskStackID, 'type', num2cell(zeros(1, length(taskStack))));
+            end
+        end
+
+        function setCurrentAction(obj, newActionIndex, currentTime)
+            if newActionIndex == obj.currentAction, return; end
+            if newActionIndex > length(obj.actions), return; end
+            
+            % Get IDs
+            oldIDs = obj.actions_ids{obj.currentAction};
+            newIDs = obj.actions_ids{newActionIndex};
+            
+            % Generate Transition Plan
+            plan = generatePriorityList(oldIDs, newIDs);
+            
+            % Build Unified Stack
+            unifiedStack = cell(1, length(plan));
+            oldStack = obj.actions{obj.currentAction};
+            newStack = obj.actions{newActionIndex};
+            
+            for i = 1:length(plan)
+                taskID = plan(i).id;
+                taskType = plan(i).type;
+                foundTask = [];
+                
+                % ROBUST FIND LOGIC
+                if taskType == -1 || taskType == 0
+                    % Look in OLD stack for Keeping(0) or Fading Out(-1)
+                    idx = find(string(oldIDs) == string(taskID), 1);
+                    if ~isempty(idx), foundTask = oldStack{idx}; end
+                end
+                
+                if isempty(foundTask) && (taskType == 1 || taskType == 0)
+                    % Look in NEW stack for Fading In(1) or Keeping(0)
+                    idx = find(string(newIDs) == string(taskID), 1);
+                    if ~isempty(idx), foundTask = newStack{idx}; end
+                end
+                
+                if isempty(foundTask)
+                    error('ActionManager: Could not find task with ID "%s"', taskID);
+                end
+                
+                unifiedStack{i} = foundTask;
+            end
+            
+            % Update State
+            obj.activeStack = unifiedStack;
+            obj.transitionPlan = plan;
+            obj.currentAction = newActionIndex;
+            obj.inTransition = true;
+            obj.t_switch = currentTime;
+            
+            fprintf('[ActionManager] Auto-Switching to Action %d at t=%.2f\n', newActionIndex, currentTime);
+        end
+
+        function [qdot] = computeICAT(obj, bm_system, currentTime)
+            
+            % --- A. Handle Transition Timing ---
+            dt_trans = 0;
+            if obj.inTransition
+                dt_trans = currentTime - obj.t_switch;
+                if dt_trans >= obj.t_max
+                    % Transition Finished
+                    obj.inTransition = false;
+                    obj.activeStack = obj.actions{obj.currentAction};
+                    currentIDs = obj.actions_ids{obj.currentAction};
+                    obj.transitionPlan = struct('id', currentIDs, ...
+                                                'type', num2cell(zeros(1, length(obj.activeStack))));
+                    fprintf('[ActionManager] Transition Complete at t=%.2f\n', currentTime);
+                end
+            end
+
+            tasks = obj.activeStack;
+            
+            % --- B. Update Tasks & Apply Activation ---
+            for i = 1:length(tasks)
+                tasks{i}.updateReference(bm_system);
+                tasks{i}.updateJacobian(bm_system);
+                tasks{i}.updateActivation(bm_system);
+                
+                % Apply Transition Gains (Bell Shaped)
+                alpha = 1.0;
+                if obj.inTransition && i <= length(obj.transitionPlan)
+                    type = obj.transitionPlan(i).type;
+                    if type == 1 % Fading In
+                        alpha = IncreasingBellShapedFunction(0, obj.t_max, 0, 1, dt_trans);
+                    elseif type == -1 % Fading Out
+                        alpha = DecreasingBellShapedFunction(0, obj.t_max, 0, 1, dt_trans);
+                    end
+                end
+                
+                tasks{i}.A = tasks{i}.A * alpha; 
+            end
+
+            % --- C. AUTO-SEQUENCER ---
+            % Check convergence of the primary task (Index 1) of the CURRENT action definition
+            if ~obj.inTransition && obj.currentAction < length(obj.actions)
+                currentDef = obj.actions{obj.currentAction};
+                primaryTask = currentDef{1}; 
+                
+                % Use Norm of reference velocity (xdotbar) as error metric
+                err_metric = norm(primaryTask.e);
+ 
+                if err_metric < obj.completion_threshold 
+                     fprintf('[ActionManager] Task Converged (Error=%.4f). Triggering next action.\n', err_metric);
+                     obj.setCurrentAction(obj.currentAction + 1, currentTime);
+                end
+            end
+            
+            % --- D. Perform ICAT (Dual Arm 14 DOF) ---
+            ydotbar = zeros(14,1);
+            Qp = eye(14);
+            
+            for i = 1:length(tasks)
+                % Only solve if activation is significant
+                if norm(tasks{i}.A, 'fro') > 1e-6
+                    [Qp, ydotbar] = iCAT_task(tasks{i}.A, tasks{i}.J, ...
+                                               Qp, ydotbar, tasks{i}.xdotbar, ...
+                                               1e-4, 0.01, 10);
+                end
+            end
+            
+            % Last task: residual damping
+            [~, ydotbar] = iCAT_task(eye(14), eye(14), Qp, ydotbar, zeros(14,1), 1e-4, 0.01, 10);
+            
+            qdot = ydotbar;
+        end        
+    end
+end
